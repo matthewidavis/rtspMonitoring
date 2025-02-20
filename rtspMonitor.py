@@ -23,7 +23,8 @@ FPS_PATTERN            = re.compile(r"fps=\s*([\d\.]+)")
 SPEED_PATTERN          = re.compile(r"speed=\s*([\d\.]+)x")
 MISSED_PACKETS_PATTERN = re.compile(r"missed (\d+) packets")
 MAX_DELAY_PATTERN      = re.compile(r"max delay reached")
-DECODE_ERROR_PATTERN   = re.compile(r"concealing (\d+) DC,\s*(\d+) AC,\s*(\d+) MV errors")
+# We'll parse lines like: "concealing 284 DC, 284 AC, 284 MV errors in I frame"
+DECODE_ERROR_PATTERN   = re.compile(r"concealing\s+(\d+)\s+DC,\s*(\d+)\s+AC,\s*(\d+)\s+MV")
 
 class CameraMonitorGUI:
     def __init__(self, master):
@@ -50,13 +51,24 @@ class CameraMonitorGUI:
         self.speed_values = deque(maxlen=50)
         self.missed_packets_count = 0
 
-        # Data for live graphing (shared x-axis and timestamps)
+        ### NEW OR MODIFIED ###
+        # Track decode errors (cumulative) and “max delay reached” events.
+        self.decode_error_count = 0
+        self.max_delay_count = 0
+
+        # Data for live graphing
         self.start_time = None
         self.graph_time_data = []
         self.graph_timestamp_labels = []
+
         self.graph_avg_fps_data = []
         self.graph_avg_speed_data = []
-        self.graph_missed_packets_data = []  # New for missed packets
+        self.graph_missed_packets_data = []
+
+        ### NEW OR MODIFIED ###
+        # Additional graphs for decode errors & max delay
+        self.graph_decode_error_data = []
+        self.graph_max_delay_data = []
 
         # Build UI
         self.create_menu()
@@ -90,7 +102,7 @@ class CameraMonitorGUI:
         # RTSP URL
         tk.Label(input_frame, text="RTSP URL:").grid(row=1, column=0, sticky=tk.E)
         tk.Entry(input_frame, textvariable=self.rtsp_url_var, width=50).grid(row=1, column=1, padx=5, pady=5)
-        
+
         # Output CSV
         tk.Label(input_frame, text="Output CSV:").grid(row=2, column=0, sticky=tk.E)
         tk.Entry(input_frame, textvariable=self.output_csv_var, width=50).grid(row=2, column=1, padx=5, pady=5)
@@ -108,36 +120,52 @@ class CameraMonitorGUI:
         self.stop_button = tk.Button(button_frame, text="Stop Monitoring", command=self.stop_monitoring, state=tk.DISABLED)
         self.stop_button.grid(row=0, column=1, padx=10)
 
-        # --- Graphs Frame (Three Graphs in one row) ---
+        # --- Graphs Frame (We'll have FOUR graphs now) ---
         graphs_frame = tk.Frame(self.master)
         graphs_frame.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
 
-        # Avg FPS Graph
+        # We need to configure the parent frame so it uses a 2x2 grid layout
+        graphs_frame.rowconfigure(0, weight=1)
+        graphs_frame.rowconfigure(1, weight=1)
+        graphs_frame.columnconfigure(0, weight=1)
+        graphs_frame.columnconfigure(1, weight=1)
+
+        # 1) Avg FPS Graph
         fps_frame = tk.Frame(graphs_frame)
-        fps_frame.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.BOTH, expand=True)
+        fps_frame.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
         self.fps_fig, self.fps_ax = plt.subplots(figsize=(4,3))
         self.fps_canvas = FigureCanvasTkAgg(self.fps_fig, master=fps_frame)
         self.fps_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         NavigationToolbar2Tk(self.fps_canvas, fps_frame)
         self.fps_canvas.mpl_connect('pick_event', self.on_pick)
 
-        # Avg Speed Graph
+        # 2) Avg Speed Graph
         speed_frame = tk.Frame(graphs_frame)
-        speed_frame.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.BOTH, expand=True)
+        speed_frame.grid(row=0, column=1, padx=5, pady=5, sticky="nsew")
         self.speed_fig, self.speed_ax = plt.subplots(figsize=(4,3))
         self.speed_canvas = FigureCanvasTkAgg(self.speed_fig, master=speed_frame)
         self.speed_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         NavigationToolbar2Tk(self.speed_canvas, speed_frame)
         self.speed_canvas.mpl_connect('pick_event', self.on_pick)
 
-        # Missed Packets Graph
+        # 3) Missed Packets Graph
         missed_frame = tk.Frame(graphs_frame)
-        missed_frame.pack(side=tk.LEFT, padx=5, pady=5, fill=tk.BOTH, expand=True)
+        missed_frame.grid(row=1, column=0, padx=5, pady=5, sticky="nsew")
         self.missed_fig, self.missed_ax = plt.subplots(figsize=(4,3))
         self.missed_canvas = FigureCanvasTkAgg(self.missed_fig, master=missed_frame)
         self.missed_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         NavigationToolbar2Tk(self.missed_canvas, missed_frame)
         self.missed_canvas.mpl_connect('pick_event', self.on_pick)
+
+        # 4) Decode Errors & Max Delay Graph
+        decode_frame = tk.Frame(graphs_frame)
+        decode_frame.grid(row=1, column=1, padx=5, pady=5, sticky="nsew")
+        self.decode_fig, self.decode_ax = plt.subplots(figsize=(4,3))
+        self.decode_canvas = FigureCanvasTkAgg(self.decode_fig, master=decode_frame)
+        self.decode_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.decode_canvas, decode_frame)
+        self.decode_canvas.mpl_connect('pick_event', self.on_pick)
+
 
         # --- Log Display Frame ---
         log_frame = tk.Frame(self.master)
@@ -197,10 +225,9 @@ class CameraMonitorGUI:
 
     def show_about(self):
         about_text = ("RTSP Camera Monitor\n"
-                      "Version 2.0\n\n"
-                      "This tool monitors an RTSP stream using FFmpeg and logs key encoding metrics.\n"
-                      "It now displays live graphs for Avg FPS, Avg Speed, and Missed Packets on a single row.\n"
-                      "Click a data point in any graph to jump to its corresponding log entry.")
+                      "Version 2.0 (with Network Issue Analysis)\n\n"
+                      "This tool monitors an RTSP stream using FFmpeg, logs key encoding metrics, "
+                      "and displays live graphs for Avg FPS, Avg Speed, Missed Packets, plus Decode Errors & Max Delay.")
         messagebox.showinfo("About", about_text)
 
     def start_monitoring(self):
@@ -236,12 +263,20 @@ class CameraMonitorGUI:
         self.speed_values.clear()
         self.missed_packets_count = 0
 
+        ### NEW OR MODIFIED ###
+        self.decode_error_count = 0
+        self.max_delay_count = 0
+
         self.start_time = time.time()
         self.graph_time_data.clear()
         self.graph_timestamp_labels.clear()
         self.graph_avg_fps_data.clear()
         self.graph_avg_speed_data.clear()
         self.graph_missed_packets_data.clear()
+
+        ### NEW OR MODIFIED ###
+        self.graph_decode_error_data.clear()
+        self.graph_max_delay_data.clear()
 
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
@@ -324,13 +359,19 @@ class CameraMonitorGUI:
                     if parsed["missed_packets"] is not None:
                         self.missed_packets_count += parsed["missed_packets"]
 
+                    ### NEW OR MODIFIED ###
+                    if parsed["decode_total"] is not None:
+                        self.decode_error_count += parsed["decode_total"]
+                    if parsed["max_delay"]:
+                        self.max_delay_count += 1
+
                     writer.writerow([
                         timestamp_str,
                         parsed["fps"] if parsed["fps"] is not None else "",
                         parsed["speed"] if parsed["speed"] is not None else "",
                         parsed["missed_packets"] if parsed["missed_packets"] else "",
                         1 if parsed["max_delay"] else 0,
-                        parsed["decode_errors"] if parsed["decode_errors"] else "",
+                        parsed["decode_str"] if parsed["decode_str"] else "",
                         line
                     ])
                     csvfile.flush()
@@ -348,33 +389,56 @@ class CameraMonitorGUI:
         self.log_queue.put("Monitoring stopped.\n")
 
     def parse_ffmpeg_line(self, line):
-        result = {"fps": None, "speed": None, "missed_packets": None, "max_delay": False, "decode_errors": None}
+        """
+        Extract relevant data, including decode errors & max delay.
+        decode_total: sum of DC+AC+MV if we parse them, otherwise None.
+        decode_str:   the raw 'DC=284, AC=284, MV=284' text, for logging.
+        """
+        result = {
+            "fps": None,
+            "speed": None,
+            "missed_packets": None,
+            "max_delay": False,
+            "decode_total": None,   # numeric sum
+            "decode_str": None      # textual
+        }
+
         fps_match = FPS_PATTERN.search(line)
         if fps_match:
             try:
                 result["fps"] = float(fps_match.group(1))
             except ValueError:
                 result["fps"] = None
+
         speed_match = SPEED_PATTERN.search(line)
         if speed_match:
             try:
                 result["speed"] = float(speed_match.group(1))
             except ValueError:
                 result["speed"] = None
+
         missed_match = MISSED_PACKETS_PATTERN.search(line)
         if missed_match:
             try:
                 result["missed_packets"] = int(missed_match.group(1))
             except ValueError:
                 result["missed_packets"] = None
+
         if MAX_DELAY_PATTERN.search(line):
             result["max_delay"] = True
+
         decode_match = DECODE_ERROR_PATTERN.search(line)
         if decode_match:
-            dc_errs = decode_match.group(1)
-            ac_errs = decode_match.group(2)
-            mv_errs = decode_match.group(3)
-            result["decode_errors"] = f"DC={dc_errs},AC={ac_errs},MV={mv_errs}"
+            try:
+                dc_errs = int(decode_match.group(1))
+                ac_errs = int(decode_match.group(2))
+                mv_errs = int(decode_match.group(3))
+                total_errs = dc_errs + ac_errs + mv_errs
+                result["decode_total"] = total_errs
+                result["decode_str"] = f"DC={dc_errs},AC={ac_errs},MV={mv_errs}"
+            except ValueError:
+                pass
+
         return result
 
     def update_log_display(self):
@@ -401,69 +465,93 @@ class CameraMonitorGUI:
 
         avg_fps = (self.sum_fps / self.total_frames) if self.total_frames > 0 else 0.0
         avg_speed = (sum(self.speed_values) / len(self.speed_values)) if self.speed_values else 0.0
-        status_text = (f"Monitoring... Avg FPS: {avg_fps:.2f}, Avg Speed: {avg_speed:.2f}x, "
-                       f"Missed Packets: {self.missed_packets_count}")
+
+        ### NEW OR MODIFIED ###
+        # Show decode_error_count & max_delay_count in the status bar
+        status_text = (f"Monitoring... Avg FPS: {avg_fps:.2f}, "
+                       f"Avg Speed: {avg_speed:.2f}x, "
+                       f"Missed Packets: {self.missed_packets_count}, "
+                       f"Decode Errors: {self.decode_error_count}, "
+                       f"Max Delay Events: {self.max_delay_count}")
         if self.running_event.is_set():
             self.status_var.set(status_text)
         if self.running_event.is_set():
             self.master.after(200, self.update_log_display)
 
     def update_graphs(self):
-        """Update the three separate graphs for Avg FPS, Avg Speed, and Missed Packets."""
+        """Update the four separate graphs: FPS, Speed, Missed Packets, and Decode/MaxDelay."""
         if self.running_event.is_set():
             current_time = time.time() - self.start_time
             avg_fps = (self.sum_fps / self.total_frames) if self.total_frames > 0 else 0.0
             avg_speed = (sum(self.speed_values) / len(self.speed_values)) if self.speed_values else 0.0
 
-            # Append current data point for all graphs
+            # Append current data point for the existing graphs
             self.graph_time_data.append(current_time)
+            self.graph_timestamp_labels.append(datetime.now().isoformat())
+
             self.graph_avg_fps_data.append(avg_fps)
             self.graph_avg_speed_data.append(avg_speed)
             self.graph_missed_packets_data.append(self.missed_packets_count)
-            self.graph_timestamp_labels.append(datetime.now().isoformat())
 
-            # Update Avg FPS graph (green)
+            ### NEW OR MODIFIED ###
+            # Append decode & max-delay counters
+            self.graph_decode_error_data.append(self.decode_error_count)
+            self.graph_max_delay_data.append(self.max_delay_count)
+
+            ## 1) Avg FPS graph
             self.fps_ax.clear()
-            line_fps, = self.fps_ax.plot(self.graph_time_data, self.graph_avg_fps_data,
-                                         marker='o', color="green", label="Avg FPS", picker=5)
+            self.fps_ax.plot(self.graph_time_data, self.graph_avg_fps_data,
+                             marker='o', color="green", label="Avg FPS", picker=5)
             if len(self.graph_time_data) > 1:
                 z = np.polyfit(self.graph_time_data, self.graph_avg_fps_data, 1)
                 p = np.poly1d(z)
-                self.fps_ax.plot(self.graph_time_data, p(np.array(self.graph_time_data)), "--",
-                                 color="green", alpha=0.5)
+                self.fps_ax.plot(self.graph_time_data, p(self.graph_time_data), "--", color="green", alpha=0.5)
             self.fps_ax.legend()
             self.fps_ax.set_xlabel("Time (s)")
             self.fps_ax.set_title("Average FPS")
             self.fps_canvas.draw()
 
-            # Update Avg Speed graph (blue)
+            ## 2) Avg Speed graph
             self.speed_ax.clear()
-            line_speed, = self.speed_ax.plot(self.graph_time_data, self.graph_avg_speed_data,
-                                             marker='o', color="blue", label="Avg Speed", picker=5)
+            self.speed_ax.plot(self.graph_time_data, self.graph_avg_speed_data,
+                               marker='o', color="blue", label="Avg Speed", picker=5)
             if len(self.graph_time_data) > 1:
                 z = np.polyfit(self.graph_time_data, self.graph_avg_speed_data, 1)
                 p = np.poly1d(z)
-                self.speed_ax.plot(self.graph_time_data, p(np.array(self.graph_time_data)), "--",
-                                   color="blue", alpha=0.5)
+                self.speed_ax.plot(self.graph_time_data, p(self.graph_time_data), "--", color="blue", alpha=0.5)
             self.speed_ax.legend()
             self.speed_ax.set_xlabel("Time (s)")
             self.speed_ax.set_title("Average Speed")
             self.speed_canvas.draw()
 
-            # Update Missed Packets graph (red)
+            ## 3) Missed Packets graph
             self.missed_ax.clear()
-            line_missed, = self.missed_ax.plot(self.graph_time_data, self.graph_missed_packets_data,
-                                               marker='o', color="red", label="Missed Packets", picker=5)
+            self.missed_ax.plot(self.graph_time_data, self.graph_missed_packets_data,
+                                marker='o', color="red", label="Missed Packets (cumulative)", picker=5)
             if len(self.graph_time_data) > 1:
                 z = np.polyfit(self.graph_time_data, self.graph_missed_packets_data, 1)
                 p = np.poly1d(z)
-                self.missed_ax.plot(self.graph_time_data, p(np.array(self.graph_time_data)), "--",
-                                    color="red", alpha=0.5)
+                self.missed_ax.plot(self.graph_time_data, p(self.graph_time_data), "--", color="red", alpha=0.5)
             self.missed_ax.legend()
             self.missed_ax.set_xlabel("Time (s)")
             self.missed_ax.set_title("Missed Packets")
             self.missed_canvas.draw()
 
+            ### NEW OR MODIFIED ###
+            ## 4) Decode Errors & Max Delay graph
+            self.decode_ax.clear()
+            # We'll plot decode errors as one line
+            self.decode_ax.plot(self.graph_time_data, self.graph_decode_error_data,
+                                marker='o', color="purple", label="Decode Errors (cumulative)", picker=5)
+            # And max-delay events as a second line
+            self.decode_ax.plot(self.graph_time_data, self.graph_max_delay_data,
+                                marker='x', color="orange", label="Max Delay Count", picker=5)
+            self.decode_ax.legend()
+            self.decode_ax.set_xlabel("Time (s)")
+            self.decode_ax.set_title("Decode Errors & Max Delay")
+            self.decode_canvas.draw()
+
+            # Reschedule
             self.master.after(1000, self.update_graphs)
 
     def on_pick(self, event):
